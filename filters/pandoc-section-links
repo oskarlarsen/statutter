@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""
+Pandoc filter to handle LaTeX section counter adjustments and cross-references.
+This filter processes \\setcounter{section}{-1} commands and adjusts section
+numbering to start from 0, fixing cross-references for HTML output.
+"""
+
+import json
+import sys
+import re
+
+def process_pandoc_json(doc):
+    """Process pandoc JSON document to handle section counter adjustments."""
+    
+    # Track section counter offset - default to -1 since we know the document uses setcounter
+    section_offset = -1
+    section_labels = {}
+    current_section = 1  # Start from 1 since we'll add offset to get 0
+    section_counter_found = False
+    
+    def process_element(elem):
+        nonlocal section_offset, current_section, section_counter_found
+        
+        if isinstance(elem, dict):
+            # Handle RawBlock LaTeX commands
+            if elem.get('t') == 'RawBlock' and elem.get('c', [None, None])[0] == 'latex':
+                latex_content = elem['c'][1]
+                
+                # Check for \\setcounter{section}{-1}
+                if r'\setcounter{section}{-1}' in latex_content:
+                    section_offset = -1
+                    section_counter_found = True
+                    # Remove this command from output
+                    return {'t': 'Null'}
+            
+            # Handle RawInline LaTeX commands  
+            elif elem.get('t') == 'RawInline' and elem.get('c', [None, None])[0] == 'latex':
+                latex_content = elem['c'][1]
+                
+                # Check for \\setcounter{section}{-1}
+                if r'\setcounter{section}{-1}' in latex_content:
+                    section_offset = -1
+                    section_counter_found = True
+                    # Remove this command from output
+                    return {'t': 'Str', 'c': ''}
+            
+            # Handle Headers (sections)
+            elif elem.get('t') == 'Header':
+                level = elem['c'][0]
+                attr = elem['c'][1]
+                content = elem['c'][2]
+                
+                if level == 1:  # Top-level section
+                    # Calculate the adjusted section number (starting from 0 if offset is -1)
+                    adjusted_section = current_section + section_offset
+                    current_section += 1
+                    
+                    # Store label mapping if this section has a label
+                    section_id = attr[0] if attr[0] else None
+                    if section_id:
+                        section_labels[section_id] = adjusted_section
+                    
+                    # Clean up section title - remove § symbols and numbers
+                    if content:
+                        # Extract the existing text content
+                        existing_text = ""
+                        for item in content:
+                            if isinstance(item, dict) and item.get('t') == 'Str':
+                                existing_text += item['c']
+                            elif isinstance(item, dict) and item.get('t') == 'Space':
+                                existing_text += " "
+                        
+                        # Remove any existing § symbol and number from the beginning
+                        if existing_text.startswith('§'):
+                            import re
+                            existing_text = re.sub(r'^§\d+\s*', '', existing_text)
+                        
+                        # Create new content with just the clean title (no § symbol)
+                        new_content = [{'t': 'Str', 'c': existing_text}]
+                        elem['c'][2] = new_content
+                
+                return elem
+            
+            # Handle Links (cross-references)
+            elif elem.get('t') == 'Link':
+                attr = elem['c'][0]
+                content = elem['c'][1]
+                target = elem['c'][2]
+                url = target[0]
+                title = target[1]
+                
+                # Check if this is an internal reference (starts with #)
+                if url.startswith('#'):
+                    ref_id = url[1:]  # Remove the #
+                    if ref_id in section_labels:
+                        # Update the link text to show correct section number
+                        adjusted_num = section_labels[ref_id]
+                        # Replace the content with the correct section number
+                        elem['c'][1] = [{'t': 'Str', 'c': f'§{adjusted_num}'}]
+                
+                return elem
+            
+            # Recursively process other elements
+            elif isinstance(elem, dict):
+                for key, value in elem.items():
+                    if isinstance(value, (list, dict)):
+                        elem[key] = process_element(value)
+        
+        elif isinstance(elem, list):
+            return [process_element(item) for item in elem]
+        
+        return elem
+    
+    # Process the document
+    if 'blocks' in doc:
+        doc['blocks'] = process_element(doc['blocks'])
+    
+    return doc
+
+def main():
+    """Main entry point for the pandoc filter."""
+    try:
+        # Read JSON from stdin
+        doc = json.load(sys.stdin)
+        
+        # Process the document
+        processed_doc = process_pandoc_json(doc)
+        
+        # Output processed JSON to stdout
+        json.dump(processed_doc, sys.stdout, separators=(',', ':'))
+        
+    except json.JSONDecodeError:
+        # If input is not JSON, just pass it through (fallback behavior)
+        sys.stdout.write(sys.stdin.read())
+    except Exception as e:
+        # Log error to stderr and pass through input
+        print(f"Error in pandoc-section-links filter: {e}", file=sys.stderr)
+        sys.stdout.write(sys.stdin.read())
+
+if __name__ == '__main__':
+    main()
