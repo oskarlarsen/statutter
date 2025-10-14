@@ -18,103 +18,127 @@ def process_pandoc_json(doc):
     current_section = 1  # Start from 1 since we'll add offset to get 0
     section_counter_found = False
     
-    def process_element(elem):
-        nonlocal section_offset, current_section, section_counter_found
-        
-        if isinstance(elem, dict):
-            # Handle RawBlock LaTeX commands
-            if elem.get('t') == 'RawBlock' and elem.get('c', [None, None])[0] == 'latex':
-                latex_content = elem['c'][1]
-                
-                # Check for \\setcounter{section}{-1}
-                if r'\setcounter{section}{-1}' in latex_content:
-                    section_offset = -1
-                    section_counter_found = True
-                    # Remove this command from output
-                    return {'t': 'Null'}
-            
-            # Handle RawInline LaTeX commands  
-            elif elem.get('t') == 'RawInline' and elem.get('c', [None, None])[0] == 'latex':
-                latex_content = elem['c'][1]
-                
-                # Check for \\setcounter{section}{-1}
-                if r'\setcounter{section}{-1}' in latex_content:
-                    section_offset = -1
-                    section_counter_found = True
-                    # Remove this command from output
-                    return {'t': 'Str', 'c': ''}
-            
-            # Handle Headers (sections)
-            elif elem.get('t') == 'Header':
-                level = elem['c'][0]
-                attr = elem['c'][1]
-                content = elem['c'][2]
-                
-                if level == 1:  # Top-level section
-                    # Calculate the adjusted section number (starting from 0 if offset is -1)
-                    adjusted_section = current_section + section_offset
-                    current_section += 1
-                    
-                    # Store label mapping if this section has a label
-                    section_id = attr[0] if attr[0] else None
-                    if section_id:
-                        section_labels[section_id] = adjusted_section
-                    
-                    # Clean up section title - remove § symbols and numbers
-                    if content:
-                        # Extract the existing text content
-                        existing_text = ""
-                        for item in content:
-                            if isinstance(item, dict) and item.get('t') == 'Str':
-                                existing_text += item['c']
-                            elif isinstance(item, dict) and item.get('t') == 'Space':
-                                existing_text += " "
-                        
-                        # Remove any existing § symbol and number from the beginning
-                        if existing_text.startswith('§'):
-                            import re
-                            existing_text = re.sub(r'^§\d+\s*', '', existing_text)
-                        
-                        # Create new content with just the clean title (no § symbol)
-                        new_content = [{'t': 'Str', 'c': existing_text}]
-                        elem['c'][2] = new_content
-                
-                return elem
-            
-            # Handle Links (cross-references)
-            elif elem.get('t') == 'Link':
-                attr = elem['c'][0]
-                content = elem['c'][1]
-                target = elem['c'][2]
-                url = target[0]
-                title = target[1]
-                
-                # Check if this is an internal reference (starts with #)
-                if url.startswith('#'):
-                    ref_id = url[1:]  # Remove the #
-                    if ref_id in section_labels:
-                        # Update the link text to show correct section number
-                        adjusted_num = section_labels[ref_id]
-                        # Replace the content with the correct section number
-                        elem['c'][1] = [{'t': 'Str', 'c': f'§{adjusted_num}'}]
-                
-                return elem
-            
-            # Recursively process other elements
-            elif isinstance(elem, dict):
-                for key, value in elem.items():
-                    if isinstance(value, (list, dict)):
-                        elem[key] = process_element(value)
-        
-        elif isinstance(elem, list):
-            return [process_element(item) for item in elem]
-        
-        return elem
+
+    # Two-pass approach: first gather headers and labels, then transform
+    def gather_labels(blocks):
+        """Walk blocks and gather label -> hierarchical-number strings.
+        We maintain counters per header level. For example, for a subsection
+        we produce '13.6'. The section counter (level 1) gets the section_offset applied.
+        """
+        labels = {}
+        # counters indexed by level-1: counters[0]=section, [1]=subsection, ...
+        counters = [0, 0, 0]
+
+        def walk(bs):
+            for b in bs:
+                if isinstance(b, dict) and b.get('t') == 'RawBlock' and isinstance(b.get('c'), list) and b['c'][0] == 'latex':
+                    text = b['c'][1]
+                    if r'\\setcounter{section}{-1}' in text or r'\setcounter{section}{-1}' in text:
+                        # set the offset so sections are effectively zero-based
+                        nonlocal_set_offset()
+                if isinstance(b, dict) and b.get('t') == 'Header':
+                    level = b['c'][0]
+                    attr = b['c'][1]
+                    # ensure counters list long enough
+                    if level-1 >= len(counters):
+                        counters.extend([0] * (level - len(counters)))
+                    # increment this level and zero deeper levels
+                    counters[level-1] += 1
+                    for i in range(level, len(counters)):
+                        counters[i] = 0
+                    # compute hierarchical number string
+                    # apply section_offset only to top-level counter
+                    parts = []
+                    for i in range(level):
+                        val = counters[i]
+                        if i == 0:
+                            val = val + section_offset
+                        parts.append(str(val))
+                    numstr = '.'.join(parts)
+                    if attr and attr[0]:
+                        labels[attr[0]] = numstr
+                # recurse into possible nested lists
+                if isinstance(b, dict):
+                    for key in ('c', 'content', 'blocks'):
+                        if key in b and isinstance(b[key], list):
+                            walk(b[key])
+
+        # helper to set section_offset from inner scope
+        def nonlocal_set_offset():
+            nonlocal section_offset
+            section_offset = -1
+
+        walk(blocks)
+        return labels
+
+    def transform_blocks(blocks):
+        """Transform headers (clean titles) and replace link texts using section_labels mapping.
+        section_labels values are strings like '13.6' now.
+        """
+        # counters for producing header numbers during transform (keep consistent with gather)
+        counters = [0, 0, 0]
+
+        def walk_and_transform(bs):
+            new = []
+            for b in bs:
+                if isinstance(b, dict) and b.get('t') == 'Header':
+                    level = b['c'][0]
+                    content = b['c'][2]
+                    # ensure counters long enough
+                    if level-1 >= len(counters):
+                        counters.extend([0] * (level - len(counters)))
+                    counters[level-1] += 1
+                    for i in range(level, len(counters)):
+                        counters[i] = 0
+                    # clean title text regardless of level
+                    existing_text = ''
+                    for item in content:
+                        if isinstance(item, dict) and item.get('t') == 'Str':
+                            existing_text += item['c']
+                        elif isinstance(item, dict) and item.get('t') == 'Space':
+                            existing_text += ' '
+                    if existing_text.startswith('§'):
+                        existing_text = re.sub(r'^§\d+(?:\.\d+)*\s*', '', existing_text)
+                    b['c'][2] = [{'t': 'Str', 'c': existing_text}]
+                # Transform links and recurse
+                def transform_element(elem):
+                    if isinstance(elem, dict):
+                        if elem.get('t') == 'Link':
+                            target = elem['c'][2]
+                            url = target[0]
+                            if isinstance(url, str) and url.startswith('#'):
+                                ref_id = url[1:]
+                                if ref_id in section_labels:
+                                    num = section_labels[ref_id]
+                                    # set link text to the hierarchical number string (no §)
+                                    elem['c'][1] = [{'t': 'Str', 'c': num}]
+                            return elem
+                        for k, v in list(elem.items()):
+                            if isinstance(v, list):
+                                elem[k] = [transform_element(x) for x in v]
+                    elif isinstance(elem, list):
+                        return [transform_element(x) for x in elem]
+                    return elem
+
+                # Recurse into nested lists
+                if isinstance(b, dict):
+                    for key in ('c', 'content', 'blocks'):
+                        if key in b and isinstance(b[key], list):
+                            b[key] = walk_and_transform(b[key])
+                    b = transform_element(b)
+                new.append(b)
+            return new
+
+        return walk_and_transform(blocks)
     
-    # Process the document
+    # Two-pass processing: gather labels first, then transform blocks
     if 'blocks' in doc:
-        doc['blocks'] = process_element(doc['blocks'])
-    
+        # gather labels (fills section_labels)
+        gathered = gather_labels(doc['blocks'])
+        section_labels.update(gathered)
+        # transform blocks using the gathered labels
+        current_section = 1
+        doc['blocks'] = transform_blocks(doc['blocks'])
     return doc
 
 def main():
