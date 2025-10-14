@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+Pandoc filter to handle LaTeX section counter adjustments and cross-references.
+This filter processes \\setcounter{section}{-1} commands and adjusts section
+numbering to start from 0, fixing cross-references for HTML output.
+"""
+
+import json
+import sys
+import re
+
+def process_pandoc_json(doc):
+    """Process pandoc JSON document to handle section counter adjustments."""
+    
+    # Track section counter offset - default to -1 since we know the document uses setcounter
+    section_offset = -1
+    section_labels = {}
+    current_section = 1  # Start from 1 since we'll add offset to get 0
+    section_counter_found = False
+    
+
+    # Two-pass approach: first gather headers and labels, then transform
+    def gather_labels(blocks):
+        """Walk blocks and gather label -> hierarchical-number strings.
+        We maintain counters per header level. For example, for a subsection
+        we produce '13.6'. The section counter (level 1) gets the section_offset applied.
+        """
+        labels = {}
+        # counters indexed by level-1: counters[0]=section, [1]=subsection, ...
+        counters = [0, 0, 0]
+
+        def walk(bs):
+            for b in bs:
+                if isinstance(b, dict) and b.get('t') == 'RawBlock' and isinstance(b.get('c'), list) and b['c'][0] == 'latex':
+                    text = b['c'][1]
+                    if r'\\setcounter{section}{-1}' in text or r'\setcounter{section}{-1}' in text:
+                        # set the offset so sections are effectively zero-based
+                        nonlocal_set_offset()
+                if isinstance(b, dict) and b.get('t') == 'Header':
+                    level = b['c'][0]
+                    attr = b['c'][1]
+                    # ensure counters list long enough
+                    if level-1 >= len(counters):
+                        counters.extend([0] * (level - len(counters)))
+                    # increment this level and zero deeper levels
+                    counters[level-1] += 1
+                    for i in range(level, len(counters)):
+                        counters[i] = 0
+                    # compute hierarchical number string
+                    # apply section_offset only to top-level counter
+                    parts = []
+                    for i in range(level):
+                        val = counters[i]
+                        if i == 0:
+                            val = val + section_offset
+                        parts.append(str(val))
+                    numstr = '.'.join(parts)
+                    if attr and attr[0]:
+                        labels[attr[0]] = numstr
+                # recurse into possible nested lists
+                if isinstance(b, dict):
+                    for key in ('c', 'content', 'blocks'):
+                        if key in b and isinstance(b[key], list):
+                            walk(b[key])
+
+        # helper to set section_offset from inner scope
+        def nonlocal_set_offset():
+            nonlocal section_offset
+            section_offset = -1
+
+        walk(blocks)
+        return labels
+
+    def transform_blocks(blocks):
+        """Transform headers (clean titles) and replace link texts using section_labels mapping.
+        section_labels values are strings like '13.6' now.
+        """
+        # counters for producing header numbers during transform (keep consistent with gather)
+        counters = [0, 0, 0]
+
+        def walk_and_transform(bs):
+            new = []
+            for b in bs:
+                if isinstance(b, dict) and b.get('t') == 'Header':
+                    level = b['c'][0]
+                    content = b['c'][2]
+                    # ensure counters long enough
+                    if level-1 >= len(counters):
+                        counters.extend([0] * (level - len(counters)))
+                    counters[level-1] += 1
+                    for i in range(level, len(counters)):
+                        counters[i] = 0
+                    # clean title text regardless of level
+                    existing_text = ''
+                    for item in content:
+                        if isinstance(item, dict) and item.get('t') == 'Str':
+                            existing_text += item['c']
+                        elif isinstance(item, dict) and item.get('t') == 'Space':
+                            existing_text += ' '
+                    if existing_text.startswith('§'):
+                        existing_text = re.sub(r'^§\d+(?:\.\d+)*\s*', '', existing_text)
+                    b['c'][2] = [{'t': 'Str', 'c': existing_text}]
+                # Transform links and recurse
+                def transform_element(elem):
+                    if isinstance(elem, dict):
+                        if elem.get('t') == 'Link':
+                            target = elem['c'][2]
+                            url = target[0]
+                            if isinstance(url, str) and url.startswith('#'):
+                                ref_id = url[1:]
+                                if ref_id in section_labels:
+                                    num = section_labels[ref_id]
+                                    # set link text to the hierarchical number string (no §)
+                                    elem['c'][1] = [{'t': 'Str', 'c': num}]
+                            return elem
+                        for k, v in list(elem.items()):
+                            if isinstance(v, list):
+                                elem[k] = [transform_element(x) for x in v]
+                    elif isinstance(elem, list):
+                        return [transform_element(x) for x in elem]
+                    return elem
+
+                # Recurse into nested lists
+                if isinstance(b, dict):
+                    for key in ('c', 'content', 'blocks'):
+                        if key in b and isinstance(b[key], list):
+                            b[key] = walk_and_transform(b[key])
+                    b = transform_element(b)
+                new.append(b)
+            return new
+
+        return walk_and_transform(blocks)
+    
+    # Two-pass processing: gather labels first, then transform blocks
+    if 'blocks' in doc:
+        # gather labels (fills section_labels)
+        gathered = gather_labels(doc['blocks'])
+        section_labels.update(gathered)
+        # transform blocks using the gathered labels
+        current_section = 1
+        doc['blocks'] = transform_blocks(doc['blocks'])
+    return doc
+
+def main():
+    """Main entry point for the pandoc filter."""
+    try:
+        # Read JSON from stdin
+        doc = json.load(sys.stdin)
+        
+        # Process the document
+        processed_doc = process_pandoc_json(doc)
+        
+        # Output processed JSON to stdout
+        json.dump(processed_doc, sys.stdout, separators=(',', ':'))
+        
+    except json.JSONDecodeError:
+        # If input is not JSON, just pass it through (fallback behavior)
+        sys.stdout.write(sys.stdin.read())
+    except Exception as e:
+        # Log error to stderr and pass through input
+        print(f"Error in pandoc-section-links filter: {e}", file=sys.stderr)
+        sys.stdout.write(sys.stdin.read())
+
+if __name__ == '__main__':
+    main()

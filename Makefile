@@ -30,8 +30,9 @@ jekyll: clean gh-pages/index.html gh-pages/$(ABAKUS).pdf
 
 gh-pages/index.html: $(ABAKUS).tex
 	@echo "---\nlayout: abakus\ntitle: Abakus' statutter\n---" > gh-pages/index.html
-	@pandoc --filter pandoc-section-links -f latex -t html $(ABAKUS)/innhold.tex >> gh-pages/index.html
+	@pandoc --filter ./filters/pandoc-section-links -f latex -t html $(ABAKUS)/innhold.tex >> gh-pages/index.html
 	@echo "Created $@"
+# The filter was changed to use the local file to accommodate our zero-indexed naming. Look at this if there are any problems in the future
 
 gh-pages/%.pdf: %.pdf
 	cp $< $@
